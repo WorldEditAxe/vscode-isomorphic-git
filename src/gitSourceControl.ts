@@ -2,386 +2,317 @@ import * as git from "isomorphic-git";
 import * as path from "path";
 import * as vscode from "vscode";
 import { FileSystem } from "./fs";
-import { GitRepository } from "./gitRepository";
+import { GitRepository, GitResource } from "./gitRepository";
 
 export class GitSourceControl implements vscode.Disposable {
-  public scm: vscode.SourceControl;
-  private indexGroup: vscode.SourceControlResourceGroup;
-  private workingTreeGroup: vscode.SourceControlResourceGroup;
-  private gitRepository: GitRepository;
-  private timeout?: NodeJS.Timer;
+  public readonly scm: vscode.SourceControl;
+  private readonly repository: GitRepository;
+  private readonly indexGroup: vscode.SourceControlResourceGroup;
+  private readonly workingTreeGroup: vscode.SourceControlResourceGroup;
+  private readonly disposables: vscode.Disposable[] = [];
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
-    context: vscode.ExtensionContext,
-    private readonly workspaceFolderUri: vscode.Uri,
+    rootUri: vscode.Uri,
     private readonly fs: FileSystem
   ) {
+    this.repository = new GitRepository(rootUri, fs);
     this.scm = vscode.scm.createSourceControl(
       "isomorphic-git",
       "isomorphic-git",
-      workspaceFolderUri
+      rootUri
     );
     this.indexGroup = this.scm.createResourceGroup("index", "Staged Changes");
-    // this.indexGroup.hideWhenEmpty = true;
     this.workingTreeGroup = this.scm.createResourceGroup(
       "workingTree",
       "Changes"
     );
-    this.gitRepository = new GitRepository(workspaceFolderUri, fs);
-    this.scm.quickDiffProvider = this.gitRepository;
-    this.scm.inputBox.placeholder = "Message to commit (Ctrl+Enter to commit)";
+    this.scm.quickDiffProvider = this.repository;
+    this.scm.inputBox.placeholder = "Message to commit";
     this.scm.acceptInputCommand = {
       command: "isomorphic-git.commit",
       title: "Commit",
       arguments: [this.scm],
-      tooltip: "Commit your changes",
-    };
-    this.refreshStatusBar();
-
-    const fileSystemWatcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(workspaceFolderUri, "*.*")
-    );
-    fileSystemWatcher.onDidChange(
-      (uri) => this.onResourceChange(uri),
-      context.subscriptions
-    );
-    fileSystemWatcher.onDidCreate(
-      (uri) => this.onResourceChange(uri),
-      context.subscriptions
-    );
-    fileSystemWatcher.onDidDelete(
-      (uri) => this.onResourceChange(uri),
-      context.subscriptions
-    );
-
-    context.subscriptions.push(this.scm);
-    context.subscriptions.push(fileSystemWatcher);
-  }
-
-  public getWorkspaceFolderUri(): vscode.Uri {
-    return this.workspaceFolderUri;
-  }
-
-  onResourceChange(_uri: vscode.Uri): void {
-    if (this.timeout) {
-      clearTimeout(this.timeout);
-    }
-    this.timeout = setTimeout(() => this.tryUpdateResourceGroups(), 500);
-  }
-
-  async tryUpdateResourceGroups(): Promise<void> {
-    try {
-      await this.updateChangedGroup();
-      await this.refreshStatusBar();
-    } catch (error) {
-      vscode.window.showErrorMessage(error);
-    }
-  }
-
-  /** This is where the source control determines, which documents were updated, removed, and theoretically added. */
-  async updateChangedGroup(): Promise<void> {
-    // for simplicity we ignore which document was changed in this event and scan all of them
-    const workingTreeGroup: vscode.SourceControlResourceState[] = [];
-    const indexGroup: vscode.SourceControlResourceState[] = [];
-
-    const result = await this.gitRepository.provideSourceControlledResources();
-    for (const [uri, deleted, staged] of result) {
-      const resourceState = this.toSourceControlResourceState(uri, deleted);
-      if (staged) {
-        indexGroup.push(resourceState);
-      } else {
-        workingTreeGroup.push(resourceState);
-      }
-    }
-
-    this.workingTreeGroup.resourceStates = workingTreeGroup;
-    this.indexGroup.resourceStates = indexGroup;
-
-    // the number of modified resources needs to be assigned to the SourceControl.count filed to let VS Code show the number.
-    this.scm.count =
-      this.workingTreeGroup.resourceStates.length +
-      this.indexGroup.resourceStates.length;
-  }
-
-  dispose() {
-    this.scm.dispose();
-  }
-
-  private async refreshStatusBar() {
-    let currentBranch: string | void = "";
-    try {
-      currentBranch = await git.currentBranch({
-        fs: this.fs,
-        dir: this.workspaceFolderUri.path,
-        fullname: false,
-      });
-      if (!currentBranch) {
-        currentBranch = (
-          await git.resolveRef({
-            fs: this.fs,
-            dir: this.workspaceFolderUri.path,
-            ref: "HEAD",
-          })
-        ).slice(0, 8);
-      }
-      this.scm.statusBarCommands = [
-        {
-          command: "isomorphic-git.checkout",
-          arguments: [this.workspaceFolderUri],
-          title: `$(git-branch) ${currentBranch}`,
-        },
-      ];
-    } catch (error) {}
-  }
-
-  toSourceControlResourceState(
-    docUri: vscode.Uri,
-    deleted: boolean
-  ): vscode.SourceControlResourceState {
-    const repositoryUri = this.gitRepository.provideOriginalResource(
-      docUri,
-      null
-    );
-
-    const command: vscode.Command = !deleted
-      ? {
-          title: "Show changes",
-          command: "vscode.diff",
-          arguments: [
-            repositoryUri,
-            docUri,
-            `isomorphic-git ${docUri.toString()} ↔ Local changes`,
-          ],
-          tooltip: `Diff your changes`,
-        }
-      : null;
-
-    const resourceState: vscode.SourceControlResourceState = {
-      resourceUri: docUri,
-      command: command,
-      decorations: {
-        strikeThrough: deleted,
-        tooltip: "File was locally deleted.",
-      },
     };
 
-    return resourceState;
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(rootUri, "**/*")
+    );
+    this.disposables.push(
+      this.scm,
+      watcher,
+      watcher.onDidChange(() => this.scheduleRefresh()),
+      watcher.onDidCreate(() => this.scheduleRefresh()),
+      watcher.onDidDelete(() => this.scheduleRefresh())
+    );
   }
 
-  async stageFile(uri: vscode.Uri, refresh: boolean = true) {
-    try {
-      await this.fs.promises.stat(uri.path);
-      await git.add({
-        fs: this.fs,
-        dir: this.workspaceFolderUri.path,
-        filepath: path.relative(this.workspaceFolderUri.path, uri.path),
-      });
-    } catch (error) {
-      await git.remove({
-        fs: this.fs,
-        dir: this.workspaceFolderUri.path,
-        filepath: path.relative(this.workspaceFolderUri.path, uri.path),
-      });
-    }
-    if (refresh) {
-      await this.tryUpdateResourceGroups();
-    }
+  get rootUri(): vscode.Uri {
+    return this.repository.rootUri;
   }
 
-  async clean(uri: vscode.Uri) {
-    await git.checkout({
+  get dir(): string {
+    return this.repository.dir;
+  }
+
+  dispose(): void {
+    clearTimeout(this.refreshTimer);
+    this.disposables.forEach((disposable) => disposable.dispose());
+  }
+
+  async refresh(): Promise<void> {
+    const resources = await this.repository.resources();
+    this.indexGroup.resourceStates = resources
+      .filter((resource) => resource.staged)
+      .map((resource) => this.toResourceState(resource));
+    this.workingTreeGroup.resourceStates = resources
+      .filter((resource) => !resource.staged)
+      .map((resource) => this.toResourceState(resource));
+    this.scm.count = resources.length;
+    await this.refreshStatus();
+  }
+
+  async stage(uri: vscode.Uri): Promise<void> {
+    await this.stageResource(uri);
+    await this.refresh();
+  }
+
+  async stageAll(
+    resources: readonly vscode.SourceControlResourceState[]
+  ): Promise<void> {
+    await Promise.all(
+      resources.map((resource) => this.stageResource(resource.resourceUri))
+    );
+    await this.refresh();
+  }
+
+  async unstage(uri: vscode.Uri): Promise<void> {
+    await this.unstageResource(uri);
+    await this.refresh();
+  }
+
+  async unstageAll(
+    resources: readonly vscode.SourceControlResourceState[]
+  ): Promise<void> {
+    await Promise.all(
+      resources.map((resource) => this.unstageResource(resource.resourceUri))
+    );
+    await this.refresh();
+  }
+
+  async discard(uri: vscode.Uri): Promise<void> {
+    await this.discardResource(uri);
+    await this.refresh();
+  }
+
+  async discardAll(
+    resources: readonly vscode.SourceControlResourceState[]
+  ): Promise<void> {
+    await Promise.all(
+      resources.map((resource) => this.discardResource(resource.resourceUri))
+    );
+    await this.refresh();
+  }
+
+  async commit(message?: string): Promise<void> {
+    const commitMessage = message || this.scm.inputBox.value;
+    if (!commitMessage.trim()) {
+      return;
+    }
+
+    const { authorName, authorEmail } = authorConfig();
+    await git.commit({
       fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      force: true,
-      filepaths: [path.relative(this.workspaceFolderUri.path, uri.path)],
-    });
-    await this.tryUpdateResourceGroups();
-  }
-
-  async unstageFile(uri: vscode.Uri, refresh: boolean = true) {
-    await git.resetIndex({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      filepath: path.relative(this.workspaceFolderUri.path, uri.path),
-    });
-    if (refresh) {
-      await this.tryUpdateResourceGroups();
-    }
-  }
-
-  async stageAll(resourceStates: vscode.SourceControlResourceState[]) {
-    const promises: Promise<void>[] = [];
-    for (let i = 0; i < resourceStates.length; i++) {
-      promises.push(this.stageFile(resourceStates[i].resourceUri, false));
-    }
-    await Promise.all(promises);
-    await this.tryUpdateResourceGroups();
-  }
-
-  async unstageAll(resourceStates: vscode.SourceControlResourceState[]) {
-    const promises: Promise<void>[] = [];
-    for (let i = 0; i < resourceStates.length; i++) {
-      promises.push(this.unstageFile(resourceStates[i].resourceUri, false));
-    }
-    await Promise.all(promises);
-    await this.tryUpdateResourceGroups();
-  }
-
-  async cleanAll(resourceStates: vscode.SourceControlResourceState[]) {
-    await git.checkout({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      force: true,
-      filepaths: resourceStates.map((state) =>
-        path.relative(this.workspaceFolderUri.path, state.resourceUri.path)
-      ),
-    });
-    await this.tryUpdateResourceGroups();
-  }
-
-  private getAuthorNameAndEmail() {
-    const config = vscode.workspace.getConfiguration("isomorphic-git");
-    const authorName = config.get<string>("authorName") || "Anonymous";
-    const authorEmail =
-      config.get<string>("authorEmail") || "anonymous@git.com";
-    return { authorName, authorEmail };
-  }
-
-  async commit(commitMessage: string) {
-    const { authorName, authorEmail } = this.getAuthorNameAndEmail();
-    const sha = await git.commit({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
+      dir: this.dir,
       message: commitMessage,
       author: {
         name: authorName,
         email: authorEmail,
       },
     });
-    await this.tryUpdateResourceGroups();
     this.scm.inputBox.value = "";
+    await this.refresh();
   }
 
-  async addRemote(remoteName: string, remoteUrl: string) {
-    await git.addRemote({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      remote: remoteName,
-      url: remoteUrl,
-    });
+  async addRemote(remote: string, url: string): Promise<void> {
+    await git.addRemote({ fs: this.fs, dir: this.dir, remote, url });
   }
 
-  async listRemotes() {
-    return await git.listRemotes({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-    });
+  async removeRemote(remote: string): Promise<void> {
+    await git.deleteRemote({ fs: this.fs, dir: this.dir, remote });
   }
 
-  async removeRemote(remoteName: string) {
-    await git.deleteRemote({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      remote: remoteName,
-    });
+  async remotes(): Promise<Array<{ remote: string; url: string }>> {
+    return git.listRemotes({ fs: this.fs, dir: this.dir });
   }
 
-  async listBranches(includingRemotes: boolean = true) {
-    let branches: string[] = await git.listBranches({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-    });
-    if (includingRemotes) {
-      const remotes = await this.listRemotes();
-      for (let i = 0; i < remotes.length; i++) {
-        const { remote } = remotes[i];
-        const remoteBranches = (
+  async branches(includeRemotes = true): Promise<string[]> {
+    const localBranches = await git.listBranches({ fs: this.fs, dir: this.dir });
+    if (!includeRemotes) {
+      return localBranches;
+    }
+
+    const remoteBranches = await Promise.all(
+      (await this.remotes()).map(async ({ remote }) =>
+        (
           await git.listBranches({
             fs: this.fs,
-            dir: this.workspaceFolderUri.path,
-            remote: remote,
+            dir: this.dir,
+            remote,
           })
-        ).map((branch) => `${remote}/${branch}`);
-        branches = branches.concat(remoteBranches || []);
-      }
-    }
-
-    return branches;
+        ).map((branch) => `${remote}/${branch}`)
+      )
+    );
+    return localBranches.concat(...remoteBranches);
   }
 
-  /**
-   * Checkout an existing branch
-   * @param branchName
-   */
-  async checkoutBranch(branchName: string) {
-    await git.checkout({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      ref: branchName,
-    });
-    await this.tryUpdateResourceGroups();
-  }
-
-  async checkoutNewBranch(newBranchName: string, ref: string | void) {
-    if (!ref) {
-      try {
-        ref = await git.currentBranch({
-          fs: this.fs,
-          dir: this.workspaceFolderUri.path,
-          fullname: false,
-        });
-      } catch (error) {}
-    }
-    if (!ref) {
-      return; // Error
-    }
-    await git.checkout({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      ref: ref,
-    });
-    await git.branch({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      ref: newBranchName,
-      checkout: true,
-    });
-    await this.tryUpdateResourceGroups();
-  }
-
-  async currentBranch() {
-    try {
-      return await git.currentBranch({
+  async currentBranch(): Promise<string | undefined> {
+    return (
+      (await git.currentBranch({
         fs: this.fs,
-        dir: this.workspaceFolderUri.path,
+        dir: this.dir,
         fullname: false,
-      });
-    } catch (error) {
-      return "";
-    }
+      })) || undefined
+    );
   }
 
-  async deleteBranch(branchName: string) {
-    await git.deleteBranch({
-      fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      ref: branchName,
-    });
-    await this.tryUpdateResourceGroups();
+  async checkout(ref: string): Promise<void> {
+    await git.checkout({ fs: this.fs, dir: this.dir, ref });
+    await this.refresh();
   }
 
-  async mergeBranch(branchName: string) {
-    const { authorName, authorEmail } = this.getAuthorNameAndEmail();
+  async createBranch(ref: string, checkout = true): Promise<void> {
+    await git.branch({ fs: this.fs, dir: this.dir, ref, checkout });
+    await this.refresh();
+  }
+
+  async createBranchFrom(newBranch: string, startPoint: string): Promise<void> {
+    await git.checkout({ fs: this.fs, dir: this.dir, ref: startPoint });
+    await this.createBranch(newBranch, true);
+  }
+
+  async deleteBranch(ref: string): Promise<void> {
+    await git.deleteBranch({ fs: this.fs, dir: this.dir, ref });
+    await this.refresh();
+  }
+
+  async merge(theirs: string): Promise<void> {
+    const { authorName, authorEmail } = authorConfig();
     await git.merge({
       fs: this.fs,
-      dir: this.workspaceFolderUri.path,
-      // ours: (await this.currentBranch()) || "",
-      theirs: branchName,
+      dir: this.dir,
+      theirs,
+      abortOnConflict: false,
       author: {
         name: authorName,
         email: authorEmail,
       },
     });
-    await this.tryUpdateResourceGroups();
+    await this.refresh();
   }
+
+  private async stageResource(uri: vscode.Uri): Promise<void> {
+    const filepath = this.relativePath(uri);
+    try {
+      await this.fs.promises.stat(uri.path);
+      await git.add({ fs: this.fs, dir: this.dir, filepath });
+    } catch {
+      await git.remove({ fs: this.fs, dir: this.dir, filepath });
+    }
+  }
+
+  private async unstageResource(uri: vscode.Uri): Promise<void> {
+    await git.resetIndex({
+      fs: this.fs,
+      dir: this.dir,
+      filepath: this.relativePath(uri),
+    });
+  }
+
+  private async discardResource(uri: vscode.Uri): Promise<void> {
+    const filepath = this.relativePath(uri);
+    if (await this.isUntracked(filepath)) {
+      await this.fs.promises.unlink(uri.path);
+      return;
+    }
+
+    await git.checkout({
+      fs: this.fs,
+      dir: this.dir,
+      force: true,
+      filepaths: [filepath],
+    });
+  }
+
+  private async isUntracked(filepath: string): Promise<boolean> {
+    const row = (await git.statusMatrix({ fs: this.fs, dir: this.dir })).find(
+      ([candidate]) => candidate === filepath
+    );
+    return row?.[1] === 0;
+  }
+
+  private scheduleRefresh(): void {
+    clearTimeout(this.refreshTimer);
+    this.refreshTimer = setTimeout(() => this.refresh(), 300);
+  }
+
+  private async refreshStatus(): Promise<void> {
+    try {
+      const branch =
+        (await this.currentBranch()) ||
+        (
+          await git.resolveRef({
+            fs: this.fs,
+            dir: this.dir,
+            ref: "HEAD",
+          })
+        ).slice(0, 8);
+      this.scm.statusBarCommands = [
+        {
+          command: "isomorphic-git.checkout",
+          title: `$(git-branch) ${branch}`,
+          arguments: [this.scm],
+        },
+      ];
+    } catch {
+      this.scm.statusBarCommands = [];
+    }
+  }
+
+  private toResourceState(resource: GitResource): vscode.SourceControlResourceState {
+    const command = resource.deleted
+      ? undefined
+      : {
+          title: "Show Changes",
+          command: "vscode.diff",
+          arguments: [
+            this.repository.provideOriginalResource(resource.uri, undefined),
+            resource.uri,
+            `${path.posix.basename(resource.uri.path)} (HEAD <-> Working Tree)`,
+          ],
+        };
+
+    return {
+      resourceUri: resource.uri,
+      command,
+      decorations: resource.deleted
+        ? {
+            strikeThrough: true,
+            tooltip: "Deleted",
+          }
+        : undefined,
+    };
+  }
+
+  private relativePath(uri: vscode.Uri): string {
+    return path.posix.relative(this.dir, uri.path);
+  }
+}
+
+function authorConfig() {
+  const config = vscode.workspace.getConfiguration("isomorphic-git");
+  return {
+    authorName: config.get<string>("authorName") || "Anonymous",
+    authorEmail: config.get<string>("authorEmail") || "anonymous@git.com",
+  };
 }

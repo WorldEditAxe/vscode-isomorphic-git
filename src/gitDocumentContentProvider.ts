@@ -3,67 +3,54 @@ import * as path from "path";
 import {
   CancellationToken,
   Disposable,
-  EventEmitter,
   TextDocumentContentProvider,
   Uri,
 } from "vscode";
 import { FileSystem } from "./fs";
 
+export const GIT_SCHEME = "isomorphic-git";
+
+export function toGitUri(rootUri: Uri, fileUri: Uri): Uri {
+  return fileUri.with({
+    scheme: GIT_SCHEME,
+    query: encodeURIComponent(rootUri.toString()),
+  });
+}
+
 export class GitDocumentContentProvider
   implements TextDocumentContentProvider, Disposable {
-  private _onDidChange = new EventEmitter<Uri>();
+  constructor(private readonly fs: FileSystem) {}
 
-  constructor(
-    private readonly fs: FileSystem,
-    private readonly nativeFSPrefix: string = "/nativefs-"
-  ) {}
-
-  dispose(): void {
-    this._onDidChange.dispose();
-  }
+  dispose(): void {}
 
   async provideTextDocumentContent(
     uri: Uri,
     token: CancellationToken
   ): Promise<string> {
     if (token.isCancellationRequested) {
-      return "Canceled";
+      return "";
     }
-    const dir = uri.path.startsWith(this.nativeFSPrefix)
-      ? uri.path.split("/").slice(0, 3).join("/") // nativefs
-      : uri.path.split("/").slice(0, 2).join("/"); // memfs
-    let currentBranch: string | void;
-    try {
-      currentBranch = await git.currentBranch({
-        fs: this.fs,
-        dir,
-      });
-    } catch (error) {}
-    if (!currentBranch) {
-      try {
-        currentBranch = await git.resolveRef({
-          fs: this.fs,
-          dir: dir,
-          ref: "HEAD",
-        });
-      } catch (error) {
-        return "";
-      }
+
+    const rootUri = Uri.parse(decodeURIComponent(uri.query));
+    const dir = rootUri.path;
+    const filepath = path.posix.relative(dir, uri.path);
+    if (!filepath || filepath.startsWith("..")) {
+      return "";
     }
+
     try {
-      const commitOid = await git.resolveRef({
-        fs: this.fs,
-        dir,
-        ref: currentBranch,
-      });
+      const ref =
+        (await git.currentBranch({ fs: this.fs, dir, fullname: false })) ||
+        "HEAD";
+      const oid = await git.resolveRef({ fs: this.fs, dir, ref });
       const { blob } = await git.readBlob({
         fs: this.fs,
         dir,
-        oid: commitOid,
-        filepath: path.relative(dir, uri.path),
+        oid,
+        filepath,
       });
-      return Buffer.from(blob).toString("utf8");
-    } catch (error) {
+      return new TextDecoder().decode(blob);
+    } catch {
       return "";
     }
   }
